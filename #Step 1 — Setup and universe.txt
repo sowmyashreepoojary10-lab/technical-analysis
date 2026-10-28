@@ -1,0 +1,362 @@
+#Step 1 — Setup and universe
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+tickers = [
+    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","HINDUNILVR.NS",
+    "ITC.NS","SBIN.NS","BHARTIARTL.NS","BAJFINANCE.NS","KOTAKBANK.NS","LT.NS",
+    "AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS","TITAN.NS","ULTRACEMCO.NS",
+    "NESTLEIND.NS","WIPRO.NS","ONGC.NS","NTPC.NS","POWERGRID.NS","M&M.NS",
+    "TMPV.NS","TATASTEEL.NS","ADANIENT.NS","ADANIPORTS.NS","JSWSTEEL.NS","COALINDIA.NS",   # was TATAMOTORS.NS
+    "HCLTECH.NS","BAJAJFINSV.NS","INDUSINDBK.NS","GRASIM.NS","TECHM.NS","DRREDDY.NS",
+    "CIPLA.NS","EICHERMOT.NS","BRITANNIA.NS","APOLLOHOSP.NS","DIVISLAB.NS","HDFCLIFE.NS",
+    "SBILIFE.NS","BAJAJ-AUTO.NS","HEROMOTOCO.NS","UPL.NS","BPCL.NS","SHREECEM.NS",
+    "TATACONSUM.NS","LTIM.NS"
+]
+
+print(f"Universe size: {len(tickers)} stocks")
+
+#Step 2 — Download price data
+prices = yf.download(tickers, start="2015-01-01", end="2026-01-01", auto_adjust=True)["Close"]
+prices = prices.dropna(axis=1, how="all")
+print(f"Got data for {prices.shape[1]} of {len(tickers)} tickers")
+prices.head()
+
+#Step 3 — Compute momentum (the ranking signal)
+monthly_prices = prices.resample("ME").last()
+lookback = 12
+skip = 1
+momentum = monthly_prices.pct_change(lookback).shift(skip)
+momentum = momentum.dropna(how="all")
+
+#Output — latest month's momentum, top and bottom:
+latest_momentum = momentum.iloc[-1].dropna().sort_values(ascending=False)
+print(latest_momentum.head())
+print(latest_momentum.tail())
+
+#Step 4 — Rank and split into long/short candidates
+n_holdings = 10
+
+def get_long_short(momentum_row, n=n_holdings):
+    row = momentum_row.dropna()
+    if len(row) < 2 * n:
+        n = len(row) // 2
+    ranked = row.sort_values(ascending=False)
+    return ranked.head(n).index.tolist(), ranked.tail(n).index.tolist()
+
+longs, shorts = get_long_short(momentum.iloc[-1])
+print("Longs:", longs)
+print("Shorts:", shorts)
+
+#Step 5 — Backtest the long-short strategy (full history, not just latest month)
+monthly_returns = monthly_prices.pct_change()
+strategy_returns, dates = [], []
+
+for i in range(len(momentum) - 1):
+    date, next_date = momentum.index[i], momentum.index[i+1]
+    if next_date not in monthly_returns.index:
+        continue
+    longs, shorts = get_long_short(momentum.loc[date])
+    if not longs or not shorts:
+        continue
+    long_ret = monthly_returns.loc[next_date, longs].mean()
+    short_ret = monthly_returns.loc[next_date, shorts].mean()
+    strategy_returns.append(long_ret - short_ret)
+    dates.append(next_date)
+
+strategy_returns = pd.Series(strategy_returns, index=dates, name="Momentum L/S")
+
+#Step 6 — Metrics: long-short vs benchmark
+
+def annualize_return(r): return (1 + r.mean())**12 - 1
+def annualize_vol(r): return r.std() * np.sqrt(12)
+def sharpe_ratio(r, rf=0.06): return ((r - rf/12).mean() / r.std()) * np.sqrt(12)
+def max_drawdown(cum): 
+    running_max = cum.cummax()
+    return ((cum - running_max) / running_max).min()
+
+cumulative_strategy = (1 + strategy_returns).cumprod()
+print(f"Annualized Return: {annualize_return(strategy_returns):.2%}")
+print(f"Sharpe Ratio: {sharpe_ratio(strategy_returns):.2f}")
+print(f"Max Drawdown: {max_drawdown(cumulative_strategy):.2%}")
+
+#Step 7 — Decompose the legs (the diagnostic step)
+long_returns, short_returns = [], []
+for i in range(len(momentum) - 1):
+    date, next_date = momentum.index[i], momentum.index[i+1]
+    if next_date not in monthly_returns.index: continue
+    longs, shorts = get_long_short(momentum.loc[date])
+    if not longs or not shorts: continue
+    long_returns.append(monthly_returns.loc[next_date, longs].mean())
+    short_returns.append(monthly_returns.loc[next_date, shorts].mean())
+
+long_returns = pd.Series(long_returns)
+short_returns = pd.Series(short_returns)
+print(f"Long leg annualized return: {annualize_return(long_returns):.2%}")
+print(f"Short leg annualized return: {annualize_return(short_returns):.2%}")
+
+#Step 8 — Pivot to long-only
+long_only_returns = []
+for i in range(len(momentum) - 1):
+    date, next_date = momentum.index[i], momentum.index[i+1]
+    if next_date not in monthly_returns.index: continue
+    longs, _ = get_long_short(momentum.loc[date])
+    if not longs: continue
+    long_only_returns.append(monthly_returns.loc[next_date, longs].mean())
+
+long_only_returns = pd.Series(long_only_returns)
+cumulative_long_only = (1 + long_only_returns).cumprod()
+print(f"Annualized Return: {annualize_return(long_only_returns):.2%}")
+print(f"Sharpe Ratio: {sharpe_ratio(long_only_returns):.2f}")
+print(f"Max Drawdown: {max_drawdown(cumulative_long_only):.2%}")
+
+#Step 9 — Technical indicators (Stage 4 of the funnel)
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_roc(prices, period=12):
+    return prices.pct_change(period) * 100
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
+
+def calculate_adx(high, low, close, period=14):
+    plus_dm = high.diff(); minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0; minus_dm[minus_dm < 0] = 0
+    plus_dm[(plus_dm - minus_dm) < 0] = 0; minus_dm[(minus_dm - plus_dm) < 0] = 0
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+def calculate_52w_high_proximity(prices, window=252):
+    return (prices / prices.rolling(window).max()) * 100
+
+
+#Step 10 — Apply indicators across all 50 stocks (the screener table)
+ohlc_data = yf.download(tickers, start="2015-01-01", end="2026-01-01", auto_adjust=True)
+ohlc_data.columns = ohlc_data.columns.swaplevel(0,1)
+ohlc_data = ohlc_data.sort_index(axis=1)
+
+screener_rows = []
+for ticker in prices.columns:
+    close, high, low = ohlc_data[ticker]["Close"], ohlc_data[ticker]["High"], ohlc_data[ticker]["Low"]
+    rsi = calculate_rsi(close)
+    roc = calculate_roc(close)
+    _, _, macd_hist = calculate_macd(close)
+    adx = calculate_adx(high, low, close)
+    high_prox = calculate_52w_high_proximity(close)
+    screener_rows.append({
+        "ticker": ticker, "close": close.iloc[-1], "rsi": rsi.iloc[-1], "roc": roc.iloc[-1],
+        "macd_hist": macd_hist.iloc[-1], "adx": adx.iloc[-1], "pct_of_52w_high": high_prox.iloc[-1]
+    })
+
+screener = pd.DataFrame(screener_rows).set_index("ticker").sort_values("roc", ascending=False)
+screener.round(2)
+
+#Step 11 — Confirmation filter (Stage 4 → Final)
+confirmed_long = screener[
+    (screener["roc"] > screener["roc"].quantile(0.7)) &
+    (screener["rsi"] < 70) & (screener["rsi"] > 50) &
+    (screener["macd_hist"] > 0) &
+    (screener["adx"] > 20)
+].sort_values("roc", ascending=False)
+
+confirmed_short = screener[
+    (screener["roc"] < screener["roc"].quantile(0.3)) &
+    (screener["rsi"] > 30) & (screener["rsi"] < 50) &
+    (screener["macd_hist"] < 0) &
+    (screener["adx"] > 20)
+].sort_values("roc")
+
+print("Confirmed longs:\n", confirmed_long)
+print("\nConfirmed shorts:\n", confirmed_short)
+
+#Step 12 — Summarize
+print(f"Started with:        {len(prices.columns)} stocks")
+print(f"After momentum rank: {n_holdings*2} candidates (top {n_holdings} + bottom {n_holdings})")
+print(f"After confirmation:  {len(confirmed_long) + len(confirmed_short)} final picks")
+print(f"Survival rate:       {(len(confirmed_long)+len(confirmed_short))/len(prices.columns):.0%}")
+
+# 13: Download the Nifty 50 benchmark
+nifty = yf.download("^NSEI", start="2015-01-01", end="2026-01-01", auto_adjust=True)["Close"]
+print(f"Nifty data: {len(nifty)} rows, {nifty.index.min()} to {nifty.index.max()}")
+
+# 14 — Define the resistance/breakout function
+def calculate_resistance_breakout(close, window=60):
+    resistance = close.shift(1).rolling(window).max()
+    breakout = close > resistance
+    return resistance, breakout
+#15 — Chart 1: Price + moving averages + resistance + breakouts
+ticker = "NTPC.NS"   # change this to chart any other stock
+lookback_days = 252
+
+close = ohlc_data[ticker]["Close"].tail(lookback_days)
+ema_fast = ohlc_data[ticker]["Close"].ewm(span=12, adjust=False).mean().tail(lookback_days)
+ema_slow = ohlc_data[ticker]["Close"].ewm(span=26, adjust=False).mean().tail(lookback_days)
+
+resistance, breakout = calculate_resistance_breakout(ohlc_data[ticker]["Close"], window=60)
+resistance = resistance.tail(lookback_days)
+breakout = breakout.tail(lookback_days)
+breakout_points = close[breakout]
+
+plt.figure(figsize=(13, 6))
+plt.plot(close.index, close, label="Close price", color="tab:blue", linewidth=1.3)
+plt.plot(ema_fast.index, ema_fast, label="12-day EMA (fast)", color="darkorange", linewidth=1, alpha=0.8)
+plt.plot(ema_slow.index, ema_slow, label="26-day EMA (slow)", color="purple", linewidth=1, alpha=0.8)
+plt.plot(resistance.index, resistance, label="Resistance (60-day rolling high)", color="tab:red", linestyle="--", linewidth=1)
+plt.scatter(breakout_points.index, breakout_points, color="green", s=40, zorder=5, label="Breakout day", marker="^")
+plt.title(f"{ticker} — Price, Moving Averages, Resistance & Breakouts")
+plt.legend(loc="upper left", fontsize=9)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#Step 16 — Chart 2: Stock vs Nifty relative strength
+nifty_aligned = nifty.reindex(close.index).ffill()
+stock_norm = (close / close.iloc[0]) * 100
+nifty_norm = (nifty_aligned / nifty_aligned.iloc[0]) * 100
+
+plt.figure(figsize=(13, 5))
+plt.plot(stock_norm.index, stock_norm, label=ticker, color="tab:blue")
+plt.plot(nifty_norm.index, nifty_norm, label="Nifty 50", color="gray", linestyle="--")
+plt.title(f"{ticker} vs Nifty 50 (both rebased to 100)")
+plt.legend(loc="upper left", fontsize=9)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#Step 17 — Chart 3: MACD
+df = indicator_results[ticker].tail(lookback_days) if 'indicator_results' in dir() else None
+
+# if indicator_results wasn't built, compute directly here instead:
+macd_line, signal_line, macd_hist = calculate_macd(ohlc_data[ticker]["Close"])
+macd_line = macd_line.tail(lookback_days)
+signal_line = signal_line.tail(lookback_days)
+macd_hist = macd_hist.tail(lookback_days)
+
+plt.figure(figsize=(13, 4))
+plt.plot(macd_line.index, macd_line, label="MACD", color="tab:blue", linewidth=1)
+plt.plot(signal_line.index, signal_line, label="Signal", color="tab:orange", linewidth=1)
+colors = ["green" if v >= 0 else "red" for v in macd_hist]
+plt.bar(macd_hist.index, macd_hist, color=colors, alpha=0.4, width=1)
+plt.axhline(0, color="black", linewidth=0.5)
+plt.title(f"{ticker} — MACD")
+plt.legend(loc="upper left", fontsize=9)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#Step 18 — Chart 4: RSI & ADX
+rsi = calculate_rsi(ohlc_data[ticker]["Close"]).tail(lookback_days)
+adx = calculate_adx(ohlc_data[ticker]["High"], ohlc_data[ticker]["Low"], ohlc_data[ticker]["Close"]).tail(lookback_days)
+
+plt.figure(figsize=(13, 4))
+plt.plot(rsi.index, rsi, label="RSI", color="purple", linewidth=1)
+plt.axhline(70, color="red", linestyle="--", linewidth=0.7, alpha=0.6)
+plt.axhline(30, color="green", linestyle="--", linewidth=0.7, alpha=0.6)
+plt.plot(adx.index, adx, label="ADX", color="brown", linewidth=1)
+plt.axhline(20, color="gray", linestyle=":", linewidth=0.7, alpha=0.6, label="ADX trend threshold (20)")
+plt.title(f"{ticker} — RSI & ADX")
+plt.legend(loc="upper left", fontsize=9)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#Step 19 — Run Steps 15-18 for every confirmed long
+confirmed_tickers = confirmed_long.index.tolist()
+print(f"Charting: {confirmed_tickers}")
+
+for ticker in confirmed_tickers:
+    lookback_days = 252
+    close = ohlc_data[ticker]["Close"].tail(lookback_days)
+    ema_fast = ohlc_data[ticker]["Close"].ewm(span=12, adjust=False).mean().tail(lookback_days)
+    ema_slow = ohlc_data[ticker]["Close"].ewm(span=26, adjust=False).mean().tail(lookback_days)
+    resistance, breakout = calculate_resistance_breakout(ohlc_data[ticker]["Close"], window=60)
+    resistance = resistance.tail(lookback_days)
+    breakout_points = close[resistance.index.isin(close[close > resistance].index)]
+
+    # Chart 1
+    plt.figure(figsize=(13, 6))
+    plt.plot(close.index, close, label="Close price", color="tab:blue", linewidth=1.3)
+    plt.plot(ema_fast.index, ema_fast, label="12-day EMA", color="darkorange", linewidth=1, alpha=0.8)
+    plt.plot(ema_slow.index, ema_slow, label="26-day EMA", color="purple", linewidth=1, alpha=0.8)
+    plt.plot(resistance.index, resistance, label="Resistance", color="tab:red", linestyle="--", linewidth=1)
+    plt.title(f"{ticker} — Price, EMAs, Resistance & Breakouts")
+    plt.legend(loc="upper left", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Chart 2
+    nifty_aligned = nifty.reindex(close.index).ffill()
+    stock_norm = (close / close.iloc[0]) * 100
+    nifty_norm = (nifty_aligned / nifty_aligned.iloc[0]) * 100
+    plt.figure(figsize=(13, 4))
+    plt.plot(stock_norm.index, stock_norm, label=ticker, color="tab:blue")
+    plt.plot(nifty_norm.index, nifty_norm, label="Nifty 50", color="gray", linestyle="--")
+    plt.title(f"{ticker} vs Nifty 50")
+    plt.legend(loc="upper left", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Chart 3
+    macd_line, signal_line, macd_hist = calculate_macd(ohlc_data[ticker]["Close"])
+    macd_line, signal_line, macd_hist = macd_line.tail(lookback_days), signal_line.tail(lookback_days), macd_hist.tail(lookback_days)
+    plt.figure(figsize=(13, 4))
+    plt.plot(macd_line.index, macd_line, label="MACD", color="tab:blue", linewidth=1)
+    plt.plot(signal_line.index, signal_line, label="Signal", color="tab:orange", linewidth=1)
+    plt.bar(macd_hist.index, macd_hist, color=["green" if v>=0 else "red" for v in macd_hist], alpha=0.4, width=1)
+    plt.axhline(0, color="black", linewidth=0.5)
+    plt.title(f"{ticker} — MACD")
+    plt.legend(loc="upper left", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Chart 4
+    rsi = calculate_rsi(ohlc_data[ticker]["Close"]).tail(lookback_days)
+    adx = calculate_adx(ohlc_data[ticker]["High"], ohlc_data[ticker]["Low"], ohlc_data[ticker]["Close"]).tail(lookback_days)
+    plt.figure(figsize=(13, 4))
+    plt.plot(rsi.index, rsi, label="RSI", color="purple", linewidth=1)
+    plt.axhline(70, color="red", linestyle="--", linewidth=0.7, alpha=0.6)
+    plt.axhline(30, color="green", linestyle="--", linewidth=0.7, alpha=0.6)
+    plt.plot(adx.index, adx, label="ADX", color="brown", linewidth=1)
+    plt.axhline(20, color="gray", linestyle=":", linewidth=0.7, alpha=0.6)
+    plt.title(f"{ticker} — RSI & ADX")
+    plt.legend(loc="upper left", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+#Step 20 — All confirmed picks vs Nifty, one combined chart
+plt.figure(figsize=(13, 7))
+nifty_window = nifty.reindex(prices.index).ffill().tail(252)
+nifty_norm = (nifty_window / nifty_window.iloc[0]) * 100
+plt.plot(nifty_norm.index, nifty_norm, label="Nifty 50", color="black", linewidth=2, linestyle="--")
+
+for ticker in confirmed_tickers:
+    stock_window = prices[ticker].tail(252)
+    stock_norm = (stock_window / stock_window.iloc[0]) * 100
+    plt.plot(stock_norm.index, stock_norm, label=ticker, linewidth=1.3)
+
+plt.title("Confirmed Momentum Picks vs Nifty 50 (past year, rebased to 100)")
+plt.legend(loc="upper left")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
